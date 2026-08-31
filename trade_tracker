@@ -1,0 +1,324 @@
+'''
+On-going monitoring of Shorted ETF Pairs
+Check for rebalancing
+This version allows running of GitHub Actions and uses online Cloud storage (Supabase - free) of trading file
+'''
+
+import os
+import pandas as pd
+import yfinance as yf
+import requests
+from datetime import datetime
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+load_dotenv()
+# ==========================================
+# SUPABASE & STORAGE SETUP
+# ==========================================
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # Use your sb_secret_ key here
+BUCKET_NAME = "handsomerob-trade-tracker"
+PORTFOLIO_FILE = "portfolio_trade_tracker.csv"
+
+def get_supabase_client() -> Client:
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+def load_live_portfolio():
+    """Securely downloads your private portfolio file from Supabase storage into memory."""
+    supabase = get_supabase_client()
+    
+    # # Check if file exists locally first (e.g. during an interactive local run)
+    # if os.path.exists(PORTFOLIO_FILE):
+    #     return pd.read_csv(PORTFOLIO_FILE)
+ 
+    try:
+        send_alerts("📥 Downloading portfolio tracking state from Supabase Private Storage...")
+
+        # print("SUPABASE_URL =", SUPABASE_URL)
+        # print("BUCKET_NAME =", BUCKET_NAME)
+        # print("FILE =", PORTFOLIO_FILE)
+
+        with open(PORTFOLIO_FILE, "wb") as f:
+            # DEBUG TO CHECK READING FILE
+            # bucket = supabase.storage.from_(BUCKET_NAME)
+            # print("Attempting download...")
+            # res = bucket.download(PORTFOLIO_FILE)
+            # print(type(res))
+            # print(res)
+            res = supabase.storage.from_(BUCKET_NAME).download(PORTFOLIO_FILE)
+            f.write(res)
+        return pd.read_csv(PORTFOLIO_FILE)
+    except Exception as e:
+        send_alerts(f"⚠️ Cloud file not found or connection failed: {e}")
+        send_alerts("Starting interactive initialization wizard...")
+        return None
+
+def save_live_portfolio(df):
+    """Saves the updated dataframe locally, uploads it to private cloud, then cleans up."""
+    supabase = get_supabase_client()
+    
+    # 1. Save locally to temporary disk space
+    df.to_csv(PORTFOLIO_FILE, index=False)
+    
+    # 2. Upload and overwrite the private file in your Supabase bucket
+    try:
+        with open(PORTFOLIO_FILE, "rb") as f:
+            supabase.storage.from_(BUCKET_NAME).upload(
+                path=PORTFOLIO_FILE, 
+                file=f, 
+                file_options={"cache-control": "3600", "upsert": "true"}
+            )
+        print("🔒 Portfolio securely synchronized and locked back in private cloud storage.")
+    except Exception as e:
+        send_alerts(f"❌ Failed to sync file to Supabase: {e}")
+        
+    # 3. Securely erase the local file if running inside a temporary GitHub runner environment
+    # If you want to keep a permanent local backup copy, comment out the lines below
+    # if os.path.exists(PORTFOLIO_FILE):
+    #     os.remove(PORTFOLIO_FILE)
+
+# ==========================================
+# 1. MULTI-PAIR STRATEGY CONFIGURATION
+# ==========================================
+PORTFOLIO_CONFIG = {
+    'QQQ_Pair': {
+        'L': 'TQQQ',
+        'I': 'SQQQ',
+        'Total_Budget': 2500.00  # Will automatically split to 1.5x Inverse : Leveraged
+    },
+    'Financials_Pair': {
+        'L': 'FAS',
+        'I': 'FAZ',
+        'Total_Budget': 2500.00
+    },
+    'Russells_Pair': {
+        'L': 'URTY',
+        'I': 'SRTY',
+        'Total_Budget': 2500.00
+    },
+    'Semi_Pair': {
+            'L': 'SOXL',
+            'I': 'SOXS',
+            'Total_Budget': 2500.00
+        },
+    # include other Shorted Pairs following same format
+}
+
+# ==========================================
+# 2. CALENDAR REBALANCE MONITOR
+# ==========================================
+def check_scheduled_rebalance():
+    """Checks if the current date is approaching a scheduled quarterly rebalance."""
+    today = datetime.now().date()
+    current_year = today.year
+    
+    quarter_ends = [
+        datetime(current_year, 3, 31).date(),
+        datetime(current_year, 6, 30).date(),
+        datetime(current_year, 9, 30).date(),
+        datetime(current_year, 12, 31).date()
+    ]
+    
+    txt = "\n--- CALENDAR REBALANCE CHECK ---"
+    send_alerts(txt)
+    for q_end in quarter_ends:
+        days_until = (q_end - today).days
+        if 0 <= days_until <= 5:
+            txt = f"⏰ REMINDER: Scheduled Quarterly Rebalance is in {days_until} days ({q_end})!"
+            send_alerts(txt)
+            return True
+        elif days_until < 0 and abs(days_until) <= 2:
+            txt = f"🚨 ALERT: Passed the Quarterly Rebalance date ({q_end}) by {abs(days_until)} days!"
+            send_alerts(txt)
+            return True
+            
+    txt = "✅ No scheduled quarterly rebalances due this week. Continuing with top-up monitoring."
+    send_alerts(txt)
+    return False
+
+# ==========================================
+# 3. DYNAMIC RATIO INITIALIZATION 
+# ==========================================
+def initialize_new_portfolio():
+    """Fallback interactive setup script run when no database exists in Supabase."""
+    print("=" * 70)
+    print("   INITIALIZING YOUR SCALABLE MULTI-PAIR TRACKER")
+    print("=" * 70)
+    print("Look at your TOS 'Activity and Positions' screen for your actual starting fills.")
+    print("Type in your true starting metrics:\n")
+    
+    initial_rows = []
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    for pair_name, pair_data in PORTFOLIO_CONFIG.items():
+        total_pair_budget = pair_data['Total_Budget']
+        
+        target_long_exposure = round(total_pair_budget / 2.5, 2)
+        target_inverse_exposure = round(target_long_exposure * 1.5, 2)
+        targets = {'L': target_long_exposure, 'I': target_inverse_exposure}
+        
+        print(f"\n--- Fills for Pair: {pair_name} (Allocated Target: ${total_pair_budget}) ---")
+        print(f"    [Strategy Breakdown Targets -> Long: ${target_long_exposure} | Inverse: ${target_inverse_exposure}]")
+        
+        for side in ['L', 'I']:
+            ticker = pair_data[side]
+            target_budget = targets[side]
+            
+            shares = float(input(f"    Enter ACTUAL whole shares shorted for {ticker}: "))
+            p_ref = float(input(f"    Enter the ACTUAL execution fill price for {ticker}: $"))
+            
+            real_starting_exposure = round(shares * p_ref, 2)
+            print(f"    ℹ️ Recorded Starting Exposure: ${real_starting_exposure} (Target was ${target_budget})")
+            
+            initial_rows.append({
+                'Timestamp': timestamp,
+                'Pair_Group': pair_name,
+                'Side': side,
+                'Ticker': ticker,
+                'Activity': 'PORTFOLIO_INITIALIZATION',
+                'Target_Exposure_Budget': target_budget, 
+                'Market_Price': p_ref,
+                'Reference_Price': p_ref,
+                'Actual_Shares_Held': shares,
+                'Trade_Qty_Executed': 0.0,
+                'Live_Absolute_Exposure': real_starting_exposure
+            })
+            print("-" * 50)
+        
+    df = pd.DataFrame(initial_rows)
+    print(f"\n✅ Scaled portfolio configuration built natively.")
+    return df
+
+# ==========================================
+# 4. MONITOR ENGINE (Utilizing Scaled Budgets)
+# ==========================================
+def monitor_live_positions():
+    rebalance_window = check_scheduled_rebalance()
+    df_portfolio = load_live_portfolio()
+
+    print(df_portfolio)
+
+    # If Supabase has no file, initialize a new file dataset
+    if df_portfolio is None:
+        df_portfolio = initialize_new_portfolio()
+    
+    all_tickers = []
+    for pair, pair_data in PORTFOLIO_CONFIG.items():
+        all_tickers.extend([pair_data['L'], pair_data['I']])
+        
+    print("\n--- PULLING LIVE MARKET DATA ---")
+    try:
+        market_feed = yf.download(all_tickers, period="1d", group_by='ticker', progress=False)
+    except Exception as e:
+        print(f"❌ Error linking to market feed: {e}")
+        return
+
+    new_logs = []
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    for pair_name, pair_data in PORTFOLIO_CONFIG.items():
+        print(f"\n[Analyzing Pair: {pair_name}]")
+        
+        for side in ['L', 'I']:
+            ticker = pair_data[side]
+            
+            asset_history = df_portfolio[df_portfolio['Ticker'] == ticker]
+            last_settled = asset_history.iloc[-1]
+            actual_shares = float(last_settled['Actual_Shares_Held'])
+            p_ref = float(last_settled['Reference_Price'])
+            target_exposure = float(last_settled['Target_Exposure_Budget']) 
+            
+            try:
+                p_today = round(float(market_feed[ticker]['Close'].iloc[0]), 2)
+            except Exception:
+                print(f"❌ Error reading data column for {ticker}. Skipping asset.")
+                continue
+            
+            live_v_t = actual_shares * p_today
+            trigger_threshold = round(0.90 * p_ref, 2)
+            
+            txt = f"  ↳ {ticker}: Short {actual_shares} shares | Ref Price: ${p_ref:.2f} | Current Close: ${p_today:.2f}"
+            send_alerts(txt)
+            
+            if p_today <= trigger_threshold and not rebalance_window:
+                txt = f"    ⚠️ TARGET BREACHED for {ticker}! Price is at or below trigger floor of ${trigger_threshold:.2f}"
+                send_alerts(txt)
+                
+                recommended_delta_s = (target_exposure - live_v_t) / p_today
+                txt = f"    👉 STRATEGY RECOMMENDATION: Short an additional {round(recommended_delta_s, 2)} shares of {ticker}."
+                send_alerts(txt)
+                
+                # --- AUTOMATED ENVIRONMENT DETECTION ---
+                # Check if running in the cloud (GitHub Actions)
+                if os.environ.get("GITHUB_ACTIONS") == "true":
+                    send_alerts("    🤖 GitHub Actions environment detected. Defaulting prompt response to 'n'.")
+                    user_executed = 'n'
+                else:
+                    # Keep interactive prompt active for your local laptop terminal
+                    user_executed = input(f"    Have you executed a top-up trade for {ticker} on TOS? (y/n): ").strip().lower()
+                 
+                if user_executed == 'y':
+                    actual_fill_price = float(input(f"    Enter your ACTUAL execution fill price per share from TOS: $"))
+                    actual_shares_added = float(input(f"    Enter the EXACT whole number of shares you shorted: "))
+                    
+                    updated_shares = actual_shares + actual_shares_added
+                    updated_p_ref = actual_fill_price
+                    trade_qty = actual_shares_added
+                    activity = "TOP-UP_EXECUTED"
+                    send_alerts(f"    ✅ Database locally updated using real-world Ref Price: ${updated_p_ref:.2f}")
+                else:
+                    send_alerts("    ⚠️ Trade postponed. Keeping previous reference benchmarks.")
+                    updated_shares = actual_shares
+                    updated_p_ref = p_ref
+                    trade_qty = 0.0
+                    activity = "TOP-UP_TRIGGERED_BUT_UNFILLED"
+            else:
+                if not p_today <= trigger_threshold:
+                    txt = f"    ✅ {ticker} Daily Passive Check. No action required."
+                    send_alerts(txt)
+                updated_shares = actual_shares
+                updated_p_ref = p_ref
+                trade_qty = 0.0
+                activity = "DAILY_PASSIVE_CHECK"
+                
+            new_logs.append({
+                'Timestamp': timestamp,
+                'Pair_Group': pair_name,
+                'Side': side,
+                'Ticker': ticker,
+                'Activity': 'QUARTER_END_HOLD' if rebalance_window else activity,  
+                'Target_Exposure_Budget': target_exposure,
+                'Market_Price': p_today,
+                'Reference_Price': updated_p_ref,
+                'Actual_Shares_Held': round(updated_shares, 2),
+                'Trade_Qty_Executed': trade_qty,
+                'Live_Absolute_Exposure': round(updated_shares * p_today, 2)
+            })
+
+    # Combine historical log files with today's state changes
+    df_new = pd.DataFrame(new_logs)
+    df_updated_portfolio = pd.concat([df_portfolio, df_new], ignore_index=True)
+    
+    # SECURE CLOUD STORAGE UPDATE SYNC CALL
+    save_live_portfolio(df_updated_portfolio)
+    send_alerts("✅ Pipeline sync operations complete.")
+
+# ==========================================
+# 5. SEND MSGS TO DISCORD
+# ==========================================
+def send_alerts(message, file_path=None):
+    print(message)
+    if DISCORD_WEBHOOK:
+        try:
+            if file_path and os.path.exists(file_path):
+                with open(file_path, "rb") as f:
+                    requests.post(DISCORD_WEBHOOK, data={"content": message}, files={"file": f})
+            else:
+                requests.post(DISCORD_WEBHOOK, json={"content": message})
+        except Exception as e:
+            print(f"Discord alerting failed: {e}")
+
+if __name__ == "__main__":
+    DISCORD_WEBHOOK = os.getenv('DISCORD_WEBHOOK')
+    monitor_live_positions()
